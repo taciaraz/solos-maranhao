@@ -1,0 +1,221 @@
+/*
+ * Mapeamento de solos do Maranhão
+ * SCRIPT 3: Predição
+ * @date: April 30, 2024
+ * Dra. Taciara Zborowski Horst (taciaraz@utfpr.edu.br)
+ */
+
+// SCRIPT 1 – Predição de granulometria para Maranhão
+// Dra. Taciara Zborowski Horst | Abril 2024
+var version = 'matriz_psd_maranhao_v3';
+var seed = 2024;
+
+var matriz = ee.FeatureCollection(
+  'projects/laboratorio-de-pedometria/assets/mapeamento-ma/dados-treinamento/' + version
+);
+
+///////////////////// DATA FOR PREDICTION /////////////////////
+var datatraining = ee.FeatureCollection(matriz)
+  .filter(ee.Filter.notNull(['id', 'log_silt_sand', 'log_clay_sand', 'system:index']));
+print('full training matrix', datatraining.limit(10));
+
+var datatraining_columns = datatraining.first().propertyNames();
+
+var remove = ee.List(['latitude', 'longitude', 'ndvi', 'Ferralsols_1', 'Nitisols_1', 'Histosols_1', 'Vertisol_1']);
+var datatraining_columns = datatraining_columns.removeAll(remove);
+
+print('covariates list', datatraining_columns);
+
+
+///////////////////// IMPORT COVARIATES /////////////////////
+var static_covariates = ee.Image(
+  'projects/laboratorio-de-pedometria/assets/mapeamento-ma/covariaveis/covariaveis_v1'
+);
+
+var renamed_static_covariates = static_covariates.rename(
+  static_covariates.bandNames().map(function(bandName) {
+    return ee.String(bandName).replace('depth_15', 'depth');
+  })
+);
+
+// Retrieve the list of band names from static_covariates
+var static_covariates_module = renamed_static_covariates.bandNames();
+
+// Filter the band names to include only those present in datatraining_columns
+var static_covariates_names = static_covariates_module.map(function(bandName) {
+  return ee.Algorithms.If(ee.List(datatraining_columns).contains(bandName), bandName, null);
+});
+
+// Remove null values from the list
+static_covariates_names = static_covariates_names.removeAll([null]);
+
+// Select the filtered covariates from renamed_static_covariates
+var selected_static_covariates = renamed_static_covariates.select(static_covariates_names);
+print('Selected covariates:', selected_static_covariates.bandNames());
+
+
+///////////////////// RANDOM FOREST PARAMETERS /////////////////////
+var rf_params = {
+  ntree: 100,
+  mtry: 16,
+  nodesize: 2,
+  maxNodes: 30,
+  sampsize: 0.632
+};
+
+///////////////////// TRAINING MODELS /////////////////////
+var randomForestModel_log_clay_sand = ee.Classifier
+  .smileRandomForest({
+    numberOfTrees: rf_params.ntree,
+    variablesPerSplit: rf_params.mtry,
+    minLeafPopulation: rf_params.nodesize,
+    bagFraction: rf_params.sampsize,
+    seed: seed
+  })
+  .setOutputMode('REGRESSION')
+  .train({
+    features: datatraining,
+    classProperty: 'log_clay_sand',
+    inputProperties: static_covariates_names
+  });
+
+var randomForestModel_log_silt_sand = ee.Classifier
+  .smileRandomForest({
+    numberOfTrees: rf_params.ntree,
+    variablesPerSplit: rf_params.mtry,
+    minLeafPopulation: rf_params.nodesize,
+    bagFraction: rf_params.sampsize,
+    seed: seed
+  })
+  .setOutputMode('REGRESSION')
+  .train({
+    features: datatraining,
+    classProperty: 'log_silt_sand',
+    inputProperties: static_covariates_names
+  });
+
+///////////////////// SPATIAL PREDICTION /////////////////////
+var biomas = ee.FeatureCollection('projects/mapbiomas-workspace/AUXILIAR/biomas_IBGE_250mil');
+var aoi = biomas;
+var aoi_bounds = aoi.geometry().bounds();
+
+var prediction_log_clay_sand = selected_static_covariates.classify(randomForestModel_log_clay_sand).rename('log_clay_sand').float();
+var prediction_log_silt_sand = selected_static_covariates.classify(randomForestModel_log_silt_sand).rename('log_silt_sand').float();
+
+var map_sand = ee.Image().expression(
+  '(1/(exp(log_clay_sand)+exp(log_silt_sand)+1))*100',
+  { log_clay_sand: prediction_log_clay_sand, log_silt_sand: prediction_log_silt_sand }
+).round().rename('prediction_sand');
+
+var map_clay = ee.Image().expression(
+  '(exp(log_clay_sand)/(exp(log_clay_sand)+exp(log_silt_sand)+1))*100',
+  { log_clay_sand: prediction_log_clay_sand, log_silt_sand: prediction_log_silt_sand }
+).round().rename('prediction_clay');
+
+var map_silt = ee.Image().expression(
+  '(exp(log_silt_sand)/(exp(log_clay_sand)+exp(log_silt_sand)+1))*100',
+  { log_clay_sand: prediction_log_clay_sand, log_silt_sand: prediction_log_silt_sand }
+).round().rename('prediction_silt');
+
+var final_images = [
+  ['sand', map_sand],
+  ['silt', map_silt],
+  ['clay', map_clay]
+];
+
+///////////////////// EXPORT MAPS /////////////////////
+final_images.forEach(function(image_info) {
+  
+  var name = image_info[0];
+  var img = image_info[1];
+  
+  Export.image.toAsset({
+    image: img.clip(aoi_bounds),  // Clip to your AOI bounds
+    description: 'export_' + name + '_' + '0-30cm',  // Task name
+    assetId: 'projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/' + name + '_' + '0-30cm',  // Change 'your_username' to your GEE user
+    region: aoi_bounds,
+    scale: 30,  // Adjust the resolution if necessary
+    maxPixels: 1e13,  // Allow exporting large images
+    crs: 'EPSG:4326'  // Optional: set coordinate reference system if needed
+  });
+
+});
+
+///////////////////// VISUALIZATION /////////////////////
+var vis_params_granulometry = {
+  min: 0,
+  max: 100,
+  palette: ['fff5eb', 'fee6ce', 'fdd0a2', 'fdae6b', 'fd8d3c', 'f16913', 'd94801', 'a63603', '7f2704']
+};
+
+Map.addLayer(map_sand, vis_params_granulometry, 'prediction_sand');
+Map.addLayer(map_silt, vis_params_granulometry, 'prediction_silt');
+Map.addLayer(map_clay, vis_params_granulometry, 'prediction_clay');
+
+var legend = ui.Panel({ style: { position: 'bottom-left', padding: '8px' } });
+legend.add(ui.Label('Soil particle size distribution (%)'));
+legend.add(ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: { bbox: [0, 0, 1, 0.1], dimensions: '100x10', palette: vis_params_granulometry.palette },
+  style: { stretch: 'horizontal' }
+}));
+var labels = [];
+for (var i = 0; i <= 100; i += 10) labels.push(ui.Label(i.toString(), {margin: '4px'}));
+legend.add(ui.Panel(labels, ui.Panel.Layout.flow('horizontal')));
+Map.add(legend);
+
+/////
+// --- EXPORTING RF MODEL
+var assetId1 = 'projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/randomForestModel_log_clay_sand';
+var arvRFclay_sand = ee.List(randomForestModel_log_clay_sand.explain().get('trees'));
+print('Model trees: randomForestModel_log_clay_sand', arvRFclay_sand)
+
+var assetId2 = 'projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/randomForestModel_log_silt_sand';
+var arvRFsilt_sand = ee.List(randomForestModel_log_silt_sand.explain().get('trees'));
+print('Model trees: randomForestModel_log_silt_sand', arvRFsilt_sand)
+
+// encodeFeatureCollection aims to split a string into smaller parts
+function encodeFeatureCollection(value) {
+    var string = ee.String.encodeJSON(value) // list as a JSON string
+    var stringLength = string.length() 
+    var maxLength = 100000 // max length of a property (GEE limit)
+    var maxProperties = 1000 // max number of properties per feature
+    var values = ee.List.sequence(0, stringLength, maxLength)
+        .map(function (start) {
+            start = ee.Number(start)
+            var end = start.add(maxLength).min(stringLength)
+            return string.slice(start, end)
+        })
+        .filter(ee.Filter.neq('item', ''))
+    var numberOfProperties = values.size()
+    return ee.FeatureCollection(ee.List.sequence(0, values.size(), maxProperties)
+        .map(function (start) {
+            start = ee.Number(start)
+            var end = start.add(maxProperties).min(numberOfProperties)  // creates slices of the string to avoid exceeding the max size
+            var propertyValues = values.slice(start, end)
+            var propertyKeys = ee.List.sequence(1, propertyValues.size())
+                .map(function (i) {
+                    return ee.Number(i).format('%d')
+                })
+            var properties = ee.Dictionary.fromLists(propertyKeys, propertyValues)
+            return ee.Feature(ee.Geometry.Point([0, 0]), properties)
+        }).filter(ee.Filter.notNull(['1']))
+    )
+}
+
+Export.table.toAsset({
+    collection: encodeFeatureCollection(arvRFclay_sand), // collection of trees to export
+    description: 'arv-trees--'+ 'randomForestModel_log_clay_sand-' + version,
+    assetId: assetId1
+});
+
+Export.table.toAsset({
+    collection: encodeFeatureCollection(arvRFsilt_sand), // collection of trees to export
+    description: 'arv-trees--'+ 'randomForestModel_log_silt_sand-' + version,
+    assetId: assetId2
+});
+
+print('Exported trees:',encodeFeatureCollection(arvRFclay_sand))
+print('Exported trees:',encodeFeatureCollection(arvRFsilt_sand))
+
+/////////////

@@ -1,0 +1,187 @@
+/*
+ * Mapeamento de solos do Maranhão
+ * SCRIPT 4: Avaliação
+ * @date: April 30, 2024
+ * Dra. Taciara Zborowski Horst (taciaraz@utfpr.edu.br)
+ */
+
+var version = 'psd_maranhao_v3';
+var seed = 2024;
+
+// 1. Importar e decodificar os modelos
+var arvRF_clay_sand = ee.FeatureCollection('projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/randomForestModel_log_clay_sand_v3');
+var arvRF_silt_sand = ee.FeatureCollection('projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/randomForestModel_log_silt_sand_v3');
+
+function decodeFeatureCollection(featureCollection) {
+  return featureCollection
+    .map(function (feature) {
+      var dict = feature.toDictionary();
+      var keys = dict.keys().map(function (key) {
+        return ee.Number.parse(ee.String(key));
+      });
+      var value = dict.values().sort(keys).join();
+      return ee.Feature(null, { value: value });
+    })
+    .aggregate_array('value')
+    .join('')
+    .decodeJSON();
+}
+
+var modelForestClay = ee.List(decodeFeatureCollection(arvRF_clay_sand));
+var modelForestSilt = ee.List(decodeFeatureCollection(arvRF_silt_sand));
+
+// 2. Importar covariáveis
+var static_covariates = ee.Image('projects/laboratorio-de-pedometria/assets/mapeamento-ma/covariaveis/covariaveis_v1');
+var covariates = static_covariates.rename(
+  static_covariates.bandNames().map(function(bandName) {
+    return ee.String(bandName).replace('depth_15', 'depth');
+  })
+);
+
+// 3. Predição e reversão para % por árvore
+var clay_list = [];
+var silt_list = [];
+var sand_list = [];
+
+var numTrees = modelForestClay.length();
+
+for (var i = 0; i < numTrees.getInfo(); i++) {
+  var tree_clay = ee.Classifier.decisionTree(modelForestClay.getString(i));
+  var tree_silt = ee.Classifier.decisionTree(modelForestSilt.getString(i));
+
+  var log_clay = covariates.classify(tree_clay).rename('log_clay');
+  var log_silt = covariates.classify(tree_silt).rename('log_silt');
+
+  var clay = ee.Image().expression(
+    '(exp(c)/(exp(c)+exp(s)+1))*100',
+    {c: log_clay, s: log_silt}
+  ).rename('clay_tree_' + i);
+
+  var silt = ee.Image().expression(
+    '(exp(s)/(exp(c)+exp(s)+1))*100',
+    {c: log_clay, s: log_silt}
+  ).rename('silt_tree_' + i);
+
+  var sand = ee.Image().expression(
+    '(1/(exp(c)+exp(s)+1))*100',
+    {c: log_clay, s: log_silt}
+  ).rename('sand_tree_' + i);
+
+  clay_list.push(clay);
+  silt_list.push(silt);
+  sand_list.push(sand);
+}
+
+// 4. Stack e cálculo das estatísticas
+var clay_stack = ee.ImageCollection(clay_list).toBands();
+var silt_stack = ee.ImageCollection(silt_list).toBands();
+var sand_stack = ee.ImageCollection(sand_list).toBands();
+
+var clay_mean = clay_stack.reduce(ee.Reducer.mean()).rename('clay_mean');
+var clay_unc = clay_stack.reduce(ee.Reducer.percentile([95]))
+  .subtract(clay_stack.reduce(ee.Reducer.percentile([5])))
+  .rename('clay_uncertainty');
+
+var silt_mean = silt_stack.reduce(ee.Reducer.mean()).rename('silt_mean');
+var silt_unc = silt_stack.reduce(ee.Reducer.percentile([95]))
+  .subtract(silt_stack.reduce(ee.Reducer.percentile([5])))
+  .rename('silt_uncertainty');
+
+var sand_mean = sand_stack.reduce(ee.Reducer.mean()).rename('sand_mean');
+var sand_unc = sand_stack.reduce(ee.Reducer.percentile([95]))
+  .subtract(sand_stack.reduce(ee.Reducer.percentile([5])))
+  .rename('sand_uncertainty');
+
+// 5. Corrigir áreas de praia/duna/areal com valores fixos
+var lulc = ee.Image('projects/mapbiomas-public/assets/brazil/lulc/collection9/mapbiomas_collection90_integration_v1')
+  .select('classification_2023');
+
+var sandy_areas = lulc.eq(23);
+
+var clay_mean_corrected = clay_mean.where(sandy_areas, 0);
+var silt_mean_corrected = silt_mean.where(sandy_areas, 0);
+var sand_mean_corrected = sand_mean.where(sandy_areas, 100);
+
+var clay_unc_corrected = clay_unc.where(sandy_areas, 0);
+var silt_unc_corrected = silt_unc.where(sandy_areas, 0);
+var sand_unc_corrected = sand_unc.where(sandy_areas, 0);
+
+// 6. Visualização
+var vis = {min: 0, max: 100, palette: ['fff5eb', 'fd8d3c', '7f2704']};
+
+// Map.addLayer(clay_mean_corrected, vis, 'Argila (%) - corrigida');
+// Map.addLayer(silt_mean_corrected, vis, 'Silte (%) - corrigida');
+// Map.addLayer(sand_mean_corrected, vis, 'Areia (%) - corrigida');
+
+// var vis_unc = {min: 0, max: 15, palette: ['000004','1b0c41','4a0c6b','781c6d','a52c60','cf4446','ed6925','fb9b06','f7d13d','fcffa4']};
+// Map.addLayer(clay_unc_corrected, vis_unc, 'Incerteza - Argila');
+// Map.addLayer(silt_unc_corrected, vis_unc, 'Incerteza - Silte');
+// Map.addLayer(sand_unc_corrected, vis_unc, 'Incerteza - Areia');
+
+
+Map.addLayer(sandy_areas.updateMask(sandy_areas), {palette: 'blue'}, 'Áreas fixadas como 100% areia');
+
+
+// 7. Exportações finais (com correção aplicada)
+var aoi = covariates.geometry();
+
+
+// Export.image.toAsset({
+//   image: clay_mean_corrected.clip(aoi),
+//   description: 'export_clay_mean_corrected',
+//   assetId: 'projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/clay_mean_0_30cm_corrected',
+//   region: aoi,
+//   scale: 30,
+//   maxPixels: 1e13,
+//   crs: 'EPSG:4326'
+// });
+
+// Export.image.toAsset({
+//   image: silt_mean_corrected.clip(aoi),
+//   description: 'export_silt_mean_corrected',
+//   assetId: 'projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/silt_mean_0_30cm_corrected',
+//   region: aoi,
+//   scale: 30,
+//   maxPixels: 1e13,
+//   crs: 'EPSG:4326'
+// });
+
+// Export.image.toAsset({
+//   image: sand_mean_corrected.clip(aoi),
+//   description: 'export_sand_mean_corrected',
+//   assetId: 'projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/sand_mean_0_30cm_corrected',
+//   region: aoi,
+//   scale: 30,
+//   maxPixels: 1e13,
+//   crs: 'EPSG:4326'
+// });
+
+// Export.image.toAsset({
+//   image: clay_unc_corrected.clip(aoi),
+//   description: 'export_clay_uncertainty_corrected',
+//   assetId: 'projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/clay_uncertainty_0_30cm_corrected',
+//   region: aoi,
+//   scale: 30,
+//   maxPixels: 1e13,
+//   crs: 'EPSG:4326'
+// });
+
+// Export.image.toAsset({
+//   image: silt_unc_corrected.clip(aoi),
+//   description: 'export_silt_uncertainty_corrected',
+//   assetId: 'projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/silt_uncertainty_0_30cm_corrected',
+//   region: aoi,
+//   scale: 30,
+//   maxPixels: 1e13,
+//   crs: 'EPSG:4326'
+// });
+
+// Export.image.toAsset({
+//   image: sand_unc_corrected.clip(aoi),
+//   description: 'export_sand_uncertainty_corrected',
+//   assetId: 'projects/laboratorio-de-pedometria/assets/mapeamento-ma/resultados/sand_uncertainty_0_30cm_corrected',
+//   region: aoi,
+//   scale: 30,
+//   maxPixels: 1e13,
+//   crs: 'EPSG:4326'
+// });
